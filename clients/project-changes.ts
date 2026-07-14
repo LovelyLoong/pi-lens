@@ -8,7 +8,6 @@ export type ProjectChangeSource =
 	| "agent-edit"
 	| "format"
 	| "autofix"
-	| "partial-apply"
 	| "lsp-edit"
 	| "external";
 

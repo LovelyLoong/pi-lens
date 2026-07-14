@@ -51,7 +51,9 @@ Coverage is tracked across multiple reads: two reads of lines 1–100 and 101–
 
 Override for a single edit: `/lens-allow-edit <path>`
 
-Mixed-validity multi-edits are atomic by default: if any `oldText` block fails preflight, pi-lens writes none of the matching blocks and returns the failure. Legacy partial application is an explicit opt-in via `--lens-partial-edit-apply` or `edit.partialApply: true` in `~/.pi-lens/config.json`.
+Mixed-validity multi-edits use **adaptive safe partial** by default. pi-lens classifies exact, unique, non-overlapping matches, asks the read guard to authorize those ranges, then narrows the in-memory request so the native host edit tool revalidates, serializes, and writes the safe subset. The same tool result preserves the native diff/patch and reports the original applied/failed indexes, the preflight snapshot hash, and a re-read instruction; TUI/RPC modes also receive a warning notification. If classification, authorization, or host execution is uncertain, pi-lens falls back safely without claiming a commit.
+
+Use `--lens-atomic-multi-edit` or `edit.mixedValidityMode: "atomic"` to withhold every mixed-validity batch. `--no-read-guard` disables adaptive classification entirely and passes the original batch unchanged to the host, whose own multi-edit preflight remains atomic.
 
 Configure behavior with `--no-read-guard` to disable entirely, or set mode to `warn` instead of `block`.
 

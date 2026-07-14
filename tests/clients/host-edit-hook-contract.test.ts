@@ -179,7 +179,10 @@ describe("public Pi edit hook contract", () => {
 			const input: EditToolInput = {
 				path: filePath,
 				edits: [
-					{ oldText: "const a = 1;", newText: "const a = 10;" },
+					{
+						oldText: "const a = 1;",
+						newText: "const a = 10; // deliberate em dash: a—b",
+					},
 					{
 						oldText: "const missing = true;",
 						newText: "const missing = false;",
@@ -241,7 +244,7 @@ describe("public Pi edit hook contract", () => {
 				laterHandlerObservedPatch: true,
 			});
 			expect(await fs.readFile(filePath, "utf-8")).toBe(
-				"const a = 10;\nconst b = 2;\n",
+				"const a = 10; // deliberate em dash: a—b\nconst b = 2;\n",
 			);
 			expect(pending.size).toBe(0);
 		} finally {

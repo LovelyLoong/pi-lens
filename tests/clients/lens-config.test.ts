@@ -67,7 +67,7 @@ describe("global pi-lens config", () => {
 			JSON.stringify({
 				widget: { visible: false },
 				format: { enabled: true, mode: "immediate" },
-				edit: { partialApply: true },
+				edit: { mixedValidityMode: "adaptive" },
 				actionableWarnings: {
 					enabled: true,
 					includeLspCodeActions: true,
@@ -81,7 +81,7 @@ describe("global pi-lens config", () => {
 		expect(loadPiLensGlobalConfig(configPath)).toEqual({
 			widget: { visible: false },
 			format: { enabled: true, mode: "immediate" },
-			edit: { partialApply: true },
+			edit: { mixedValidityMode: "adaptive" },
 			actionableWarnings: {
 				enabled: true,
 				includeLspCodeActions: true,
@@ -94,15 +94,19 @@ describe("global pi-lens config", () => {
 		expect(getGlobalImmediateFormatDefault(configPath)).toBe(true);
 	});
 
-	it("ignores invalid format modes", () => {
+	it("ignores invalid format and mixed-validity modes", () => {
 		const home = makeTempHome();
 		const configPath = writeConfig(
 			home,
-			JSON.stringify({ format: { enabled: false, mode: "later" } }),
+			JSON.stringify({
+				format: { enabled: false, mode: "later" },
+				edit: { mixedValidityMode: "always-partial" },
+			}),
 		);
 
 		expect(loadPiLensGlobalConfig(configPath)).toEqual({
 			format: { enabled: false, mode: undefined },
+			edit: { mixedValidityMode: undefined },
 		});
 		expect(getGlobalAutoformatEnabled(configPath)).toBe(false);
 		expect(getGlobalImmediateFormatDefault(configPath)).toBe(false);
@@ -138,26 +142,24 @@ describe("global pi-lens config", () => {
 		);
 	});
 
-	it("keeps partial edit application disabled by default and allows explicit opt-in", () => {
+	it("uses adaptive mixed-validity handling by default with an atomic kill switch", () => {
 		expect(
-			resolvePiLensFlag("lens-partial-edit-apply", false, undefined),
+			resolvePiLensFlag("lens-atomic-multi-edit", false, undefined),
 		).toBe(false);
-		expect(resolvePiLensFlag("lens-partial-edit-apply", false, {})).toBe(
-			false,
-		);
+		expect(resolvePiLensFlag("lens-atomic-multi-edit", false, {})).toBe(false);
 		expect(
-			resolvePiLensFlag("lens-partial-edit-apply", false, {
-				edit: { partialApply: false },
+			resolvePiLensFlag("lens-atomic-multi-edit", false, {
+				edit: { mixedValidityMode: "adaptive" },
 			}),
 		).toBe(false);
 		expect(
-			resolvePiLensFlag("lens-partial-edit-apply", false, {
-				edit: { partialApply: true },
+			resolvePiLensFlag("lens-atomic-multi-edit", false, {
+				edit: { mixedValidityMode: "atomic" },
 			}),
 		).toBe(true);
 		expect(
-			resolvePiLensFlag("lens-partial-edit-apply", true, {
-				edit: { partialApply: false },
+			resolvePiLensFlag("lens-atomic-multi-edit", true, {
+				edit: { mixedValidityMode: "adaptive" },
 			}),
 		).toBe(true);
 	});

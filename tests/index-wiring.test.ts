@@ -20,7 +20,7 @@ const EXPECTED_FLAGS = [
 	"lens-guard",
 	"no-opengrep",
 	"no-read-guard",
-	"lens-partial-edit-apply",
+	"lens-atomic-multi-edit",
 	"no-lens-context",
 ];
 const EXPECTED_COMMANDS = [

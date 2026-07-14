@@ -60,7 +60,11 @@ function shouldLogEvent(event: string): boolean {
 		event === "oldtext_escape_autopatched" ||
 		event === "edit_range_relocated" ||
 		event === "edit_preflight_blocked" ||
-		event === "edit_partial_apply" ||
+		event === "edit_adaptive_partial_planned" ||
+		event === "edit_adaptive_partial_fallback" ||
+		event === "edit_adaptive_partial_committed" ||
+		event === "edit_adaptive_partial_rejected" ||
+		event === "edit_adaptive_partial_terminal_cleanup" ||
 		event === "touched_lines_missing"
 	);
 }

@@ -4,7 +4,11 @@ import {
 	hostWouldApplyOldText,
 	normalizeForGuardMatch,
 } from "./host-edit-normalize.js";
-import type { PartiallyApplicableEdit } from "./partial-edit-apply.js";
+import {
+	hashAdaptivePartialSnapshot,
+	type AdaptivePartialCandidate,
+	type AdaptivePartialFailure,
+} from "./adaptive-partial-edit.js";
 import { logReadGuardEvent } from "./read-guard-logger.js";
 import { isToolCallEventType } from "./tool-event.js";
 
@@ -14,10 +18,12 @@ export interface GuardLineResult {
 	// When set, read-guard checks each range independently instead of the bounding box.
 	editRanges?: [number, number][];
 	preflightError?: string;
-	// Edits that resolved successfully when only a subset failed preflight.
-	// Caller can apply these directly and return a ⚠️ PARTIAL APPLY message.
-	// Shares the host-pinned edit shape with applyPartiallyApplicableEdits.
-	partiallyApplicable?: PartiallyApplicableEdit[];
+	// Exact, unique candidates and classified failures for host-backed adaptive
+	// partial execution. The caller may narrow the in-memory host input only after
+	// read-guard authorization and overlap validation; this module never writes.
+	partialCandidates?: AdaptivePartialCandidate[];
+	partialFailures?: AdaptivePartialFailure[];
+	partialSnapshotHash?: string;
 	// All edits were resolved by exact content match — range snapshot staleness
 	// is irrelevant since the content IS the edit target.
 	contentMatchValidated?: boolean;
@@ -131,9 +137,9 @@ export function countFileLines(filePath: string): number {
 // the comparison below, so it runs on the PRIMARY match here, before any of
 // the Tier A/B/C fallbacks in tryCorrectIndentationMismatchFromContent are
 // even reached. Comparison-only, same as every tier below it — the bytes
-// actually written on a successful edit are always the caller's original
-// oldText/newText (see resolveOldTextEdits / applyPartiallyApplicableEdits),
-// never this normalized form.
+// actually delegated on a successful edit use the caller's original newText
+// and an exact host-ready oldText (see resolveOldTextEdits); this normalized
+// comparison form is never written.
 function normalizeContent(text: string): string {
 	return normalizeForGuardMatch(text);
 }
@@ -370,11 +376,8 @@ function resolveOldTextEdits(
 	const failedEditIndexes: number[] = [];
 	const failedOldTextPreviews: string[] = [];
 	const resolvedRanges: [number, number][] = [];
-	const passedEdits: Array<{
-		oldText: string;
-		newText: string | undefined;
-		originalIndex: number;
-	}> = [];
+	const partialCandidates: AdaptivePartialCandidate[] = [];
+	const partialFailures: AdaptivePartialFailure[] = [];
 	let maxFailCount = 0;
 
 	for (let i = 0; i < edits.length; i++) {
@@ -479,6 +482,11 @@ function resolveOldTextEdits(
 				}
 			}
 			errors.push(errorMsg);
+			partialFailures.push({
+				originalIndex: editIndex,
+				reason: "oldText_not_found",
+				message: errorMsg,
+			});
 			// Counterfactual: would the host's edit tool have applied this oldText
 			// anyway? hostWouldApply=true => this block is a false-block (pi-lens
 			// friction the host wouldn't have); false => a genuine miss. This is the
@@ -504,11 +512,26 @@ function resolveOldTextEdits(
 			const endLine = startLine + needle.split("\n").length - 1;
 			resolvedRanges.push([startLine, endLine]);
 			const applyOldText = exactOldTextForApply(rawContentLf, oldText, needle);
-			if (applyOldText !== undefined) {
-				passedEdits.push({
+			const newText = edits[i].newText;
+			const matchStart =
+				applyOldText === undefined ? -1 : rawContentLf.indexOf(applyOldText);
+			if (
+				applyOldText !== undefined &&
+				matchStart >= 0 &&
+				typeof newText === "string"
+			) {
+				partialCandidates.push({
 					oldText: applyOldText,
-					newText: edits[i].newText,
+					newText,
 					originalIndex: editIndex,
+					range: [startLine, endLine],
+					matchSpan: [matchStart, matchStart + applyOldText.length],
+				});
+			} else {
+				partialFailures.push({
+					originalIndex: editIndex,
+					reason: "unsupported_match",
+					message: `edits[${editIndex}] resolved for diagnostics but could not be represented as an exact host edit candidate. Re-read and retry it separately.`,
 				});
 			}
 			logReadGuardEvent({
@@ -533,9 +556,13 @@ function resolveOldTextEdits(
 				occurrenceLines,
 				matchSpanLines,
 			);
-			errors.push(
-				`edits[${editIndex}].oldText ("${preview}") appears ${occurrenceLines.length} times:\n${contextBlock}\nPick the location you want and extend your oldText with the unique line above or below it (shown as context).`,
-			);
+			const errorMsg = `edits[${editIndex}].oldText ("${preview}") appears ${occurrenceLines.length} times:\n${contextBlock}\nPick the location you want and extend your oldText with the unique line above or below it (shown as context).`;
+			errors.push(errorMsg);
+			partialFailures.push({
+				originalIndex: editIndex,
+				reason: "oldText_duplicate",
+				message: errorMsg,
+			});
 			logReadGuardEvent({
 				event: "oldtext_duplicate",
 				sessionId,
@@ -589,7 +616,11 @@ function resolveOldTextEdits(
 		return {
 			touchedLines: undefined,
 			preflightError: `${header}\n\n${failureDetails.join("\n\n")}`,
-			partiallyApplicable: passedEdits.length > 0 ? passedEdits : undefined,
+			partialCandidates:
+				partialCandidates.length > 0 ? partialCandidates : undefined,
+			partialFailures:
+				partialFailures.length > 0 ? partialFailures : undefined,
+			partialSnapshotHash: hashAdaptivePartialSnapshot(rawContent),
 		};
 	}
 

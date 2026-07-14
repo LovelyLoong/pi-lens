@@ -240,16 +240,7 @@ function getFileStateHash(filePath: string): string {
 	}
 }
 
-function sourceForToolName(
-	toolName: string,
-	details?: unknown,
-): ProjectChangeSource {
-	if (
-		(details as { piLensPartialApply?: unknown } | undefined)
-			?.piLensPartialApply
-	) {
-		return "partial-apply";
-	}
+function sourceForToolName(toolName: string): ProjectChangeSource {
 	return toolName === "write" ? "agent-write" : "agent-edit";
 }
 
@@ -545,7 +536,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		runtime,
 		cwd: turnStateCwd,
 		filePath,
-		source: sourceForToolName(event.toolName, event.details),
+		source: sourceForToolName(event.toolName),
 		changedRange: singleRange(modifiedRanges),
 		dbg,
 	});

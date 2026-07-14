@@ -88,7 +88,10 @@ import {
 	computeTrailingWhitespaceOldTextPatch,
 	findUniqueMatchLineRange,
 } from "./clients/oldtext-autopatch.js";
-import { applyPartiallyApplicableEdits } from "./clients/partial-edit-apply.js";
+import {
+	AdaptivePartialCoordinator,
+	buildAdaptivePartialPlan,
+} from "./clients/adaptive-partial-edit.js";
 import { normalizeForGuardMatch } from "./clients/host-edit-normalize.js";
 import { retargetReplacementIndentation } from "./clients/indent-retarget.js";
 import { handleAgentEnd } from "./clients/runtime-agent-end.js";
@@ -470,6 +473,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	const astGrepClient = new AstGrepClient();
 	const cacheManager = new CacheManager();
+	const adaptivePartialCoordinator = new AdaptivePartialCoordinator();
 
 	type LspStatusTheme = {
 		fg: (
@@ -611,9 +615,9 @@ export default function (pi: ExtensionAPI) {
 		default: false,
 	});
 
-	pi.registerFlag("lens-partial-edit-apply", {
+	pi.registerFlag("lens-atomic-multi-edit", {
 		description:
-			"Opt in to applying the matching subset of a failed multi-edit. Disabled by default to preserve the host edit tool's atomic semantics. Also via edit.partialApply=true in ~/.pi-lens/config.json.",
+			"Withhold every mixed-validity multi-edit instead of delegating a proven-safe subset to the native host edit tool. Also via edit.mixedValidityMode=\"atomic\" in ~/.pi-lens/config.json.",
 		type: "boolean",
 		default: false,
 	});
@@ -2078,6 +2082,9 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		if (isEditOnly && filePath && !getLensFlag("no-read-guard")) {
+			const editInput = event.input as {
+				edits: Array<{ oldText: string; newText: string }>;
+			};
 			const readGuard = runtime.readGuard;
 			const isExistingFile =
 				typeof readGuard?.isNewFile !== "function" ||
@@ -2087,113 +2094,102 @@ export default function (pi: ExtensionAPI) {
 					touchedLines,
 					editRanges,
 					preflightError,
-					partiallyApplicable,
+					partialCandidates,
+					partialFailures,
+					partialSnapshotHash,
 					contentMatchValidated,
 				} = getTouchedLinesForGuard(
 					event,
 					filePath,
 					runtime.telemetrySessionId,
 				);
+				let adaptivePartialPlanned = false;
 				if (preflightError) {
-					const partialApplyEnabled =
-						getLensFlag("lens-partial-edit-apply") === true;
+					const adaptiveEnabled =
+						getLensFlag("lens-atomic-multi-edit") !== true;
 					if (
-						partialApplyEnabled &&
-						partiallyApplicable &&
-						partiallyApplicable.length > 0
+						adaptiveEnabled &&
+						partialCandidates &&
+						partialFailures &&
+						partialSnapshotHash
 					) {
-						try {
-							const partial = await applyPartiallyApplicableEdits({
+						const planResult = buildAdaptivePartialPlan({
+							toolCallId: event.toolCallId,
+							filePath,
+							beforeHash: partialSnapshotHash,
+							originalEditCount: editInput.edits.length,
+							candidates: partialCandidates,
+							failures: partialFailures,
+						});
+						if (planResult.ok) {
+							const candidateRanges = planResult.plan.selected.map(
+								(candidate) => candidate.range,
+							);
+							const candidateTouchedLines: [number, number] = [
+								Math.min(...candidateRanges.map(([start]) => start)),
+								Math.max(...candidateRanges.map(([, end]) => end)),
+							];
+							const candidateVerdict =
+								typeof readGuard.checkEdit === "function"
+									? readGuard.checkEdit(
+											filePath,
+											candidateTouchedLines,
+											candidateRanges.length > 1
+												? candidateRanges
+												: undefined,
+											{
+												skipSnapshotCheck: true,
+												oldTextResolved: true,
+											},
+										)
+									: { action: "allow" as const };
+							if (candidateVerdict.action === "block") {
+								return { block: true, reason: candidateVerdict.reason };
+							}
+							adaptivePartialCoordinator.remember(planResult.plan);
+							editInput.edits = planResult.narrowedEdits;
+							adaptivePartialPlanned = true;
+							logReadGuardEvent({
+								event: "edit_adaptive_partial_planned",
+								sessionId: runtime.telemetrySessionId,
 								filePath,
-								edits: partiallyApplicable,
-								afterWrite: async () => {
-									const {
-										biomeClient,
-										ruffClient,
-										metricsClient,
-										agentBehaviorClient,
-									} = await loadBootstrapClients();
-									const result = await handleToolResult({
-										event: {
-											toolName: "write",
-											input: { path: filePath },
-											details: { piLensPartialApply: true },
-											content: [],
-											provider: (event as { provider?: string }).provider,
-											model: (event as { model?: string }).model,
-											sessionId: (event as { sessionId?: string }).sessionId,
-											session: (event as { session?: { id?: string } }).session,
-										},
-										getFlag: (name: string) => getLensFlag(name),
-										dbg,
-										runtime,
-										cacheManager,
-										biomeClient,
-										ruffClient,
-										metricsClient,
-										resetLSPService,
-										readGuard: runtime.readGuard,
-										agentBehaviorRecord: (toolName, analyzedPath) =>
-											agentBehaviorClient.recordToolCall(
-												toolName,
-												analyzedPath,
-											),
-										formatBehaviorWarnings: (warnings) =>
-											agentBehaviorClient.formatWarnings(warnings as any),
-									});
-									return result?.content
-										?.map((item) => item.text)
-										.filter((text): text is string => !!text)
-										.join("\n\n");
+								metadata: {
+									toolCallId: event.toolCallId,
+									appliedIndices: planResult.plan.selected.map(
+										(candidate) => candidate.originalIndex,
+									),
+									failedIndices: planResult.plan.failed.map(
+										(failure) => failure.originalIndex,
+									),
 								},
 							});
-							if (partial.appliedCount > 0) {
-								logReadGuardEvent({
-									event: "edit_partial_apply",
-									sessionId: runtime.telemetrySessionId,
-									filePath,
-									metadata: {
-										appliedCount: partial.appliedCount,
-										appliedIndices: partial.appliedIndices,
-										routedThroughPostEditPipeline: true,
-									},
-								});
-								let reason = preflightError.replace(
-									"🔄 RETRYABLE — Edit target not found",
-									`⚠️ PARTIAL APPLY — ${partial.appliedCount} edit${partial.appliedCount !== 1 ? "s" : ""} applied (${partial.appliedIndices})`,
-								);
-								reason += `\n\nDo not re-submit ${partial.appliedIndices}; only retry the unresolved edit targets.`;
-								if (partial.postEditOutput) {
-									reason += `\n\nPost-apply analysis:\n${partial.postEditOutput}`;
-								}
-								return { block: true, reason };
-							}
-						} catch (error) {
-							const message =
-								error instanceof Error ? error.message : String(error);
+						} else {
+							logReadGuardEvent({
+								event: "edit_adaptive_partial_fallback",
+								sessionId: runtime.telemetrySessionId,
+								filePath,
+								metadata: { reason: planResult.reason },
+							});
+						}
+					}
+					if (!adaptivePartialPlanned) {
+						if (partialCandidates && partialCandidates.length > 0) {
+							const matchedIndices = partialCandidates
+								.map((edit) => `edits[${edit.originalIndex}]`)
+								.join(", ");
 							return {
 								block: true,
 								reason:
 									`${preflightError}\n\n` +
-									`⚠️ PARTIAL APPLY ERROR — Disk state may have changed before post-edit analysis failed (${message}). Re-read the file before retrying.`,
+									`🔒 ATOMIC EDIT — No changes were written. ${matchedIndices} matched, but the batch was withheld because adaptive safety could not be proven or atomic mode was requested. Correct the unresolved targets and retry the full batch.`,
 							};
 						}
+						return { block: true, reason: preflightError };
 					}
-					if (partiallyApplicable && partiallyApplicable.length > 0) {
-						const matchedIndices = partiallyApplicable
-							.map((edit) => `edits[${edit.originalIndex}]`)
-							.join(", ");
-						return {
-							block: true,
-							reason:
-								`${preflightError}\n\n` +
-								`🔒 ATOMIC EDIT — No changes were written. ${matchedIndices} matched, but the entire batch was withheld because at least one edit target failed preflight. Correct the unresolved targets and retry the full batch.`,
-						};
-					}
-					return { block: true, reason: preflightError };
 				}
-				logReadGuardEvent({
-					event: "edit_check_started",
+				if (!adaptivePartialPlanned) {
+					logReadGuardEvent({
+						event: "edit_check_started",
 					sessionId: runtime.telemetrySessionId,
 					filePath,
 					metadata: {
@@ -2248,11 +2244,12 @@ export default function (pi: ExtensionAPI) {
 					} else if (verdict.action === "block") {
 						return { block: true, reason: verdict.reason };
 					}
-				} else if (verdict.action === "block") {
-					return {
-						block: true,
-						reason: verdict.reason,
-					};
+					} else if (verdict.action === "block") {
+						return {
+							block: true,
+							reason: verdict.reason,
+						};
+					}
 				}
 			}
 		}
@@ -2307,6 +2304,104 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 	});
+
+	// Annotate host-backed partial success before any diagnostic or formatting
+	// work can fail. Later result handlers receive this patched result in sequence.
+	// biome-ignore lint/suspicious/noExplicitAny: pi.on overload mismatch for tool_result event type
+	(pi as any).on("tool_result", async (event: any, ctx: any) => {
+		if (!lensEnabled) return;
+		const pendingPlan = adaptivePartialCoordinator.peek(event.toolCallId);
+		try {
+			const annotation = await adaptivePartialCoordinator.consumeToolResult(event);
+			if (!annotation) return;
+			try {
+				ctx?.ui?.notify?.(annotation.notification, "warning");
+			} catch (notifyError) {
+				dbg(`adaptive partial notification failed: ${notifyError}`);
+			}
+			logReadGuardEvent({
+				event: annotation.patch.isError
+					? "edit_adaptive_partial_rejected"
+					: "edit_adaptive_partial_committed",
+				sessionId: runtime.telemetrySessionId,
+				filePath: annotation.plan.filePath,
+				metadata: {
+					toolCallId: annotation.plan.toolCallId,
+					appliedIndices: annotation.patch.isError
+						? []
+						: annotation.plan.selected.map(
+								(candidate) => candidate.originalIndex,
+							),
+					attemptedIndices: annotation.plan.selected.map(
+						(candidate) => candidate.originalIndex,
+					),
+					failedIndices: annotation.plan.failed.map(
+						(failure) => failure.originalIndex,
+					),
+				},
+			});
+			return annotation.patch;
+		} catch (error) {
+			adaptivePartialCoordinator.clear(event.toolCallId);
+			if (!pendingPlan || event.isError) return;
+			const message = error instanceof Error ? error.message : String(error);
+			const details =
+				event.details && typeof event.details === "object"
+					? event.details
+					: {};
+			return {
+				content: [
+					...event.content,
+					{
+						type: "text",
+						text: `⚠️ PARTIAL STATUS ERROR — The native host reported success for a narrowed edit subset, but pi-lens could not finish annotating its status (${message}). The disk may contain the selected edits. Re-read the file before any retry.`,
+					},
+				],
+				details: {
+					...details,
+					piLensPartial: {
+						status: "annotation_error",
+						committed: "uncertain",
+						beforeHash: pendingPlan.beforeHash,
+					},
+				},
+				isError: false,
+			};
+		}
+	});
+
+	// afterToolCall/tool_result runs before tool_execution_end in the host loop.
+	// This terminal hook therefore clears only leftovers from errors/aborts where
+	// no normal result annotation consumed the plan.
+	(pi as any).on(
+		"tool_execution_end",
+		(
+			event: { toolCallId?: string; isError?: boolean },
+			ctx: { ui?: { notify?: (message: string, level: "warning") => void } },
+		) => {
+			if (!event.toolCallId) return;
+			const abandonedPlan = adaptivePartialCoordinator.peek(event.toolCallId);
+			adaptivePartialCoordinator.clear(event.toolCallId);
+			if (!abandonedPlan) return;
+			const message = event.isError
+				? "Adaptive partial ended before result annotation. No commit is claimed; re-read before retrying."
+				: "Adaptive partial host execution ended without result annotation. Disk state is uncertain; re-read before retrying.";
+			try {
+				ctx?.ui?.notify?.(message, "warning");
+			} catch (notifyError) {
+				dbg(`adaptive partial terminal notification failed: ${notifyError}`);
+			}
+			logReadGuardEvent({
+				event: "edit_adaptive_partial_terminal_cleanup",
+				sessionId: runtime.telemetrySessionId,
+				filePath: abandonedPlan.filePath,
+				metadata: {
+					toolCallId: abandonedPlan.toolCallId,
+					isError: event.isError ?? null,
+				},
+			});
+		},
+	);
 
 	// Real-time feedback on file writes/edits
 	// biome-ignore lint/suspicious/noExplicitAny: pi.on overload mismatch for tool_result event type
@@ -2430,6 +2525,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("turn_end", async (_event: any, ctx) => {
+		adaptivePartialCoordinator.clearAll();
 		if (!lensEnabled) return;
 		// Esc/abort during the turn-end flush (knip/madge/tests + debounced
 		// dispatch) kills in-flight children instead of waiting out their timeout.
@@ -2621,6 +2717,7 @@ export default function (pi: ExtensionAPI) {
 	// The LSP idle-reset timer (240s) is unref'd but we cancel it explicitly here
 	// so it does not fire after shutdown. resetLSPService shuts down any live clients.
 	(pi as any).on("session_shutdown", (_event: unknown, ctx: unknown) => {
+		adaptivePartialCoordinator.clearAll();
 		// #473: a concurrently-live in-process subagent session shutting down
 		// (its sibling primary — the real parent — still active) must NOT run
 		// the shared-infra teardown below: no LSP fleet shutdown, no idle-timer

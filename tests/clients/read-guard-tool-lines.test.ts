@@ -533,19 +533,28 @@ describe("read-guard tool line helpers", () => {
 			expect(result.preflightError).toMatch(/edits\[1\]/);
 			expect(result.preflightError).toMatch(/was not found/);
 			expect(result.preflightError).not.toMatch(/was applied/);
-			expect(result.partiallyApplicable).toEqual([
-				{
+			expect(result.partialCandidates).toEqual([
+				expect.objectContaining({
 					oldText: "function bar() {\n  return 2;\n}",
 					newText: "ok",
 					originalIndex: 0,
-				},
+					range: [5, 7],
+				}),
 			]);
+			expect(result.partialCandidates?.[0].matchSpan[0]).toBeGreaterThan(0);
+			expect(result.partialFailures).toEqual([
+				expect.objectContaining({
+					originalIndex: 1,
+					reason: "oldText_not_found",
+				}),
+			]);
+			expect(result.partialSnapshotHash).toMatch(/^[a-f0-9]{64}$/);
 		} finally {
 			env.cleanup();
 		}
 	});
 
-	it("does not mark normalized-only matches as partially applicable", () => {
+	it("does not mark normalized-only matches as adaptive candidates", () => {
 		const env = setupTestEnvironment("read-guard-lines-partial-not-exact-");
 		try {
 			const filePath = path.join(env.tmpDir, "file.ts");
@@ -569,7 +578,19 @@ describe("read-guard tool line helpers", () => {
 			);
 
 			expect(result.preflightError).toMatch(/RETRYABLE/);
-			expect(result.partiallyApplicable).toBeUndefined();
+			expect(result.partialCandidates).toBeUndefined();
+			expect(result.partialFailures).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						originalIndex: 0,
+						reason: "unsupported_match",
+					}),
+					expect.objectContaining({
+						originalIndex: 1,
+						reason: "oldText_not_found",
+					}),
+				]),
+			);
 		} finally {
 			env.cleanup();
 		}

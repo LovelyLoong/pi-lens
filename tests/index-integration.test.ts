@@ -624,40 +624,48 @@ describe("index.ts integration", () => {
 
 	it.each([
 		{
-			mode: "default atomic mode",
-			allowPartialApply: false,
-			expectedContent: "const a = 1;\nconst b = 2;\n",
-			expectedMarker: "🔒 ATOMIC EDIT",
-			unexpectedMarker: "PARTIAL APPLY",
-			expectedPostEditCalls: 0,
+			mode: "default adaptive mode",
+			atomicKillSwitch: false,
+			noReadGuard: false,
+			guardBlocks: false,
 		},
 		{
-			mode: "explicit partial-apply opt-in",
-			allowPartialApply: true,
-			expectedContent: "const a = 10;\nconst b = 2;\n",
-			expectedMarker: "⚠️ PARTIAL APPLY",
-			unexpectedMarker: "ATOMIC EDIT",
-			expectedPostEditCalls: 1,
+			mode: "explicit atomic kill switch",
+			atomicKillSwitch: true,
+			noReadGuard: false,
+			guardBlocks: false,
+		},
+		{
+			mode: "read guard disabled host-atomic passthrough",
+			atomicKillSwitch: false,
+			noReadGuard: true,
+			guardBlocks: false,
+		},
+		{
+			mode: "adaptive candidate blocked by read guard",
+			atomicKillSwitch: false,
+			noReadGuard: false,
+			guardBlocks: true,
 		},
 	])(
 		"keeps mixed-validity multi-edits safe in $mode",
 		async ({
-			allowPartialApply,
-			expectedContent,
-			expectedMarker,
-			unexpectedMarker,
-			expectedPostEditCalls,
+			atomicKillSwitch,
+			noReadGuard,
+			guardBlocks,
 		}: {
-			allowPartialApply: boolean;
-			expectedContent: string;
-			expectedMarker: string;
-			unexpectedMarker: string;
-			expectedPostEditCalls: number;
+			atomicKillSwitch: boolean;
+			noReadGuard: boolean;
+			guardBlocks: boolean;
 		}) => {
 			const sourceFile = path.join(tmpDir, "src", "mixed-edit.ts");
 			fs.mkdirSync(path.dirname(sourceFile), { recursive: true });
 			fs.writeFileSync(sourceFile, "const a = 1;\nconst b = 2;\n");
-			const checkEdit = vi.fn(() => ({ action: "allow" as const }));
+			const checkEdit = vi.fn(() =>
+				guardBlocks
+					? ({ action: "block" as const, reason: "guard blocked candidate" } as const)
+					: ({ action: "allow" as const } as const),
+			);
 			const handleToolResult = vi.fn(async () => undefined);
 
 			vi.doMock("../clients/runtime-coordinator.js", () => ({
@@ -737,35 +745,156 @@ describe("index.ts integration", () => {
 				const { default: registerExtension } = await import("../index.ts");
 				const { pi, handlers } = createMockPi({
 					"no-lsp": true,
-					"lens-partial-edit-apply": allowPartialApply,
+					"no-read-guard": noReadGuard,
+					"lens-atomic-multi-edit": atomicKillSwitch,
 				});
 				registerExtension(pi as any);
 
 				const toolCall = handlers.tool_call?.[0];
 				expect(toolCall).toBeTypeOf("function");
-				const result = (await toolCall?.(
-					{
+				const event = {
+					toolName: "edit",
+					toolCallId: "mixed-edit-call",
+					input: {
+						path: sourceFile,
+						edits: [
+							{ oldText: "const a = 1;", newText: "const a = 10;" },
+							{
+								oldText: "const missing = true;",
+								newText: "const missing = false;",
+							},
+						],
+					},
+				};
+				const result = (await toolCall?.(event, { cwd: tmpDir })) as
+					| { block: boolean; reason: string }
+					| undefined;
+
+				// Preflight itself never writes, in either mode.
+				expect(fs.readFileSync(sourceFile, "utf-8")).toBe(
+					"const a = 1;\nconst b = 2;\n",
+				);
+				if (noReadGuard) {
+					expect(result).toBeUndefined();
+					expect(event.input.edits).toHaveLength(2);
+					expect(checkEdit).not.toHaveBeenCalled();
+					expect(handleToolResult).not.toHaveBeenCalled();
+				} else if (guardBlocks) {
+					expect(result).toEqual({
+						block: true,
+						reason: "guard blocked candidate",
+					});
+					expect(event.input.edits).toHaveLength(2);
+					expect(checkEdit).toHaveBeenCalledTimes(1);
+					expect(handleToolResult).not.toHaveBeenCalled();
+				} else if (atomicKillSwitch) {
+					expect(result?.block).toBe(true);
+					expect(result?.reason).toContain("🔒 ATOMIC EDIT");
+					expect(event.input.edits).toHaveLength(2);
+					expect(checkEdit).not.toHaveBeenCalled();
+					expect(handleToolResult).not.toHaveBeenCalled();
+				} else {
+					expect(result).toBeUndefined();
+					expect(event.input.edits).toEqual([
+						{ oldText: "const a = 1;", newText: "const a = 10;" },
+					]);
+					expect(checkEdit).toHaveBeenCalledTimes(1);
+
+					// Simulate the native host's successful execution of the narrowed input.
+					fs.writeFileSync(sourceFile, "const a = 10;\nconst b = 2;\n");
+					const nativeDetails = {
+						diff: "native-diff",
+						patch: "native-patch",
+						firstChangedLine: 1,
+					};
+					const resultEvent = {
+						type: "tool_result",
 						toolName: "edit",
+						toolCallId: event.toolCallId,
+						input: event.input,
+						content: [{ type: "text", text: "Applied 1 edit" }],
+						details: nativeDetails,
+						isError: false,
+					};
+					const notify = vi.fn();
+					const toolResults = handlers.tool_result ?? [];
+					expect(toolResults).toHaveLength(2);
+					const annotation = (await toolResults[0](resultEvent, {
+						cwd: tmpDir,
+						ui: { notify },
+					})) as {
+						content: Array<{ type: string; text: string }>;
+						details: Record<string, unknown>;
+						isError: boolean;
+					};
+					expect(annotation.content.at(-1)?.text).toContain("PARTIAL SUCCESS");
+					expect(annotation.details).toMatchObject({
+						...nativeDetails,
+						piLensPartial: {
+							status: "partial_success",
+							committed: true,
+							applied: [0],
+							failed: [expect.objectContaining({ index: 1 })],
+						},
+					});
+					expect(annotation.isError).toBe(false);
+					expect(notify).toHaveBeenCalledWith(
+						expect.stringContaining("applied edits[0]"),
+						"warning",
+					);
+
+					await toolResults[1](
+						{ ...resultEvent, ...annotation },
+						{ cwd: tmpDir },
+					);
+					expect(handleToolResult).toHaveBeenCalledTimes(1);
+					expect(fs.readFileSync(sourceFile, "utf-8")).toBe(
+						"const a = 10;\nconst b = 2;\n",
+					);
+
+					const abortedEvent = {
+						toolName: "edit",
+						toolCallId: "aborted-mixed-edit",
 						input: {
 							path: sourceFile,
 							edits: [
-								{ oldText: "const a = 1;", newText: "const a = 10;" },
-								{
-									oldText: "const missing = true;",
-									newText: "const missing = false;",
-								},
+								{ oldText: "const b = 2;", newText: "const b = 20;" },
+								{ oldText: "never present", newText: "still absent" },
 							],
 						},
-					},
-					{ cwd: tmpDir },
-				)) as { block: boolean; reason: string };
-
-				expect(result.block).toBe(true);
-				expect(result.reason).toContain(expectedMarker);
-				expect(result.reason).not.toContain(unexpectedMarker);
-				expect(fs.readFileSync(sourceFile, "utf-8")).toBe(expectedContent);
-				expect(handleToolResult).toHaveBeenCalledTimes(expectedPostEditCalls);
-				expect(checkEdit).not.toHaveBeenCalled();
+					};
+					expect(await toolCall?.(abortedEvent, { cwd: tmpDir })).toBeUndefined();
+					expect(abortedEvent.input.edits).toHaveLength(1);
+					const terminal = handlers.tool_execution_end?.[0];
+					expect(terminal).toBeTypeOf("function");
+					await terminal?.(
+						{
+							type: "tool_execution_end",
+							toolName: "edit",
+							toolCallId: abortedEvent.toolCallId,
+							result: { content: [] },
+							isError: true,
+						},
+						{ cwd: tmpDir, ui: { notify } },
+					);
+					expect(notify).toHaveBeenCalledWith(
+						expect.stringContaining("No commit is claimed"),
+						"warning",
+					);
+					const lateAnnotation = await toolResults[0](
+						{
+							type: "tool_result",
+							toolName: "edit",
+							toolCallId: abortedEvent.toolCallId,
+							input: abortedEvent.input,
+							content: [{ type: "text", text: "late result" }],
+							details: {},
+							isError: false,
+						},
+						{ cwd: tmpDir, ui: { notify } },
+					);
+					expect(lateAnnotation).toBeUndefined();
+				}
 			} finally {
 				vi.doUnmock("../clients/runtime-tool-result.js");
 				if (previousConfigPath === undefined) {
@@ -1329,17 +1458,24 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 		expect(turnStart).toBeTypeOf("function");
 		await turnStart?.({}, { cwd: tmpDir });
 
-		const toolResult = handlers.tool_result?.[0];
-		expect(toolResult).toBeTypeOf("function");
-		await toolResult?.(
-			{
-				toolName: "edit",
-				input: { path: filePath },
-				details: { diff: "+  1 export const x = 1;" },
-				content: [{ type: "text", text: "base" }],
-			},
-			{ cwd: tmpDir, ui: { notify: vi.fn() }, signal: undefined },
-		);
+		const toolResults = handlers.tool_result ?? [];
+		expect(toolResults.length).toBeGreaterThan(0);
+		let resultEvent: Record<string, unknown> = {
+			type: "tool_result",
+			toolName: "edit",
+			toolCallId: "turn-summary-edit",
+			input: { path: filePath },
+			details: { diff: "+  1 export const x = 1;" },
+			content: [{ type: "text", text: "base" }],
+			isError: false,
+		};
+		for (const toolResult of toolResults) {
+			const patch = (await toolResult(
+				resultEvent,
+				{ cwd: tmpDir, ui: { notify: vi.fn() }, signal: undefined },
+			)) as Record<string, unknown> | undefined;
+			if (patch) resultEvent = { ...resultEvent, ...patch };
+		}
 
 		const turnEnd = handlers.turn_end?.[0];
 		expect(turnEnd).toBeTypeOf("function");

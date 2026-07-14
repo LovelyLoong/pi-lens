@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 export type PiLensFormatMode = "deferred" | "immediate";
+export type PiLensMixedValidityMode = "adaptive" | "atomic";
 
 export interface PiLensGlobalConfig {
 	/**
@@ -32,10 +33,11 @@ export interface PiLensGlobalConfig {
 	};
 	edit?: {
 		/**
-		 * Whether pi-lens may apply the matching subset of a failed multi-edit.
-		 * Defaults false so the host edit tool retains all-or-nothing semantics.
+		 * How mixed-validity multi-edits are handled. Adaptive delegates a proven
+		 * safe subset to the native host edit tool; atomic withholds the full batch.
+		 * Defaults to adaptive.
 		 */
-		partialApply?: boolean;
+		mixedValidityMode?: PiLensMixedValidityMode;
 	};
 	actionableWarnings?: {
 		/** Write turn-delta fixable warning reports and inject a short advisory. */
@@ -129,6 +131,11 @@ export function loadPiLensGlobalConfig(
 			format?.mode === "immediate" || format?.mode === "deferred"
 				? format.mode
 				: undefined;
+		const mixedValidityMode =
+			edit?.mixedValidityMode === "adaptive" ||
+			edit?.mixedValidityMode === "atomic"
+				? edit.mixedValidityMode
+				: undefined;
 		const ignore = Array.isArray(raw.ignore)
 			? raw.ignore.filter((p): p is string => typeof p === "string")
 			: undefined;
@@ -158,14 +165,7 @@ export function loadPiLensGlobalConfig(
 						mode: formatMode,
 					}
 				: undefined,
-			edit: edit
-				? {
-						partialApply:
-							typeof edit.partialApply === "boolean"
-								? edit.partialApply
-								: undefined,
-					}
-				: undefined,
+			edit: edit ? { mixedValidityMode } : undefined,
 			actionableWarnings: actionableWarnings
 				? {
 						enabled:
@@ -250,8 +250,8 @@ export function resolvePiLensFlag(
 	if (name === "immediate-format") {
 		return config?.format?.mode === "immediate";
 	}
-	if (name === "lens-partial-edit-apply") {
-		return config?.edit?.partialApply === true;
+	if (name === "lens-atomic-multi-edit") {
+		return config?.edit?.mixedValidityMode === "atomic";
 	}
 	if (name === "lens-actionable-warnings") {
 		return config?.actionableWarnings?.enabled === true;
